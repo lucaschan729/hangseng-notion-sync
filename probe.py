@@ -1,8 +1,6 @@
-import io
+import collections
 import re
-from urllib.parse import urljoin
 
-import pdfplumber
 import requests
 
 PAGES = {
@@ -12,132 +10,90 @@ PAGES = {
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
       "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8"}
-KEYS = ("pdf", "fulfil", "ratio", "payout", "實現", "分紅", "支付率", "download", "下載")
-MAX_PDF = 6
-
-
-def fetch(url):
-    note = ""
-    try:
-        r = requests.get(url, headers=UA, timeout=60)
-        if r.status_code == 200:
-            return r.content, "普通連線"
-        note = f"普通連線 {r.status_code}"
-    except Exception as e:
-        note = f"普通連線 {type(e).__name__}"
-    try:
-        from curl_cffi import requests as cr
-        for imp in ("chrome", "safari"):
-            r = cr.get(url, impersonate=imp, timeout=60)
-            if r.status_code == 200:
-                return r.content, f"curl_cffi {imp}"
-            note += f"｜{imp} {r.status_code}"
-    except Exception as e:
-        note += f"｜curl_cffi {type(e).__name__}"
-    return None, note
+S = re.S | re.I
 
 
 def strip(s):
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s)).strip()
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = s.replace("&nbsp;", " ").replace("&amp;", "&")
+    return re.sub(r"\s+", " ", s).strip()
 
 
-def links(html, base):
-    out, seen = [], set()
-    for href, inner in re.findall(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', html, flags=re.S | re.I):
-        text = strip(inner)
-        url = urljoin(base, href.strip())
-        blob = (url + " " + text).lower()
-        if url in seen or not any(k in blob for k in KEYS):
+def nodes(seg):
+    """回傳 [(標籤, class, 文字)]"""
+    out = []
+    for m in re.finditer(r"<([a-zA-Z0-9]+)\b([^>]*)>([^<]+)", seg):
+        text = strip(m.group(3))
+        if not text:
             continue
-        seen.add(url)
-        out.append((url, text))
+        cls = re.search(r'class=["\']([^"\']*)["\']', m.group(2))
+        out.append((m.group(1).lower(), cls.group(1)[:50] if cls else "", text[:70]))
     return out
 
 
-def show_tables(html):
-    tables = re.findall(r"<table\b.*?</table>", html, flags=re.S | re.I)
-    print(f"HTML 表格 {len(tables)} 個")
-    for i, t in enumerate(tables[:6], 1):
-        rows = re.findall(r"<tr\b.*?</tr>", t, flags=re.S | re.I)
-        print(f"--- 表格 {i}：{len(rows)} 行（前 6 行） ---")
-        for row in rows[:6]:
-            cells = re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", row, flags=re.S | re.I)
-            print("   " + " | ".join(strip(c)[:30] for c in cells))
-    return len(tables)
-
-
-def show_hints(html, base):
-    found = re.findall(r'["\']([^"\'\s<>]+\.(?:json|pdf|xlsx?|csv)(?:\?[^"\'\s<>]*)?)["\']', html, flags=re.I)
-    found += re.findall(r'<iframe\b[^>]*src=["\']([^"\']+)["\']', html, flags=re.I)
-    uniq = list(dict.fromkeys(urljoin(base, u) for u in found))
-    print(f"資料檔線索（json／pdf／xlsx／iframe）{len(uniq)} 條：")
-    for u in uniq[:40]:
-        print(f" - {u}")
-
-
-def show_text(html):
-    body = re.sub(r"<(script|style)\b.*?</\1>", " ", html, flags=re.S | re.I)
-    lines = [strip(x) for x in re.split(r"</(?:p|div|li|h\d|tr|td|th)>|<br\s*/?>", body, flags=re.I)]
-    lines = [x for x in lines if x and ("%" in x or "實現率" in x or "支付率" in x or "保單年度" in x)]
-    print(f"頁面文字中有關鍵字的行 {len(lines)} 行（前 40 行）：")
-    for x in lines[:40]:
-        print("   " + x[:120])
-
-
-def show_pdf(url):
-    data, how = fetch(url)
-    if data is None:
-        print(f"   ✗ 下載失敗（{how}）")
-        return
-    if not data.startswith(b"%PDF"):
-        print(f"   － 不是 PDF（{len(data) // 1024} KB，{how}）")
-        return
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        meta = (pdf.metadata or {}).get("CreationDate", "")
-        full = "\n".join(p.extract_text() or "" for p in pdf.pages)
-        print(f"   ✓ PDF {len(data) // 1024} KB｜{len(pdf.pages)} 頁｜建立 {meta}｜{how}")
-        print("   --- 文字（前 40 行） ---")
-        for line in full.splitlines()[:40]:
-            print("   " + line)
-        for i, page in enumerate(pdf.pages[:2], 1):
-            for j, table in enumerate(page.extract_tables()[:3], 1):
-                cols = max(len(r) for r in table) if table else 0
-                print(f"   --- 第 {i} 頁 表格 {j}：{len(table)} 行 × {cols} 欄（前 6 行） ---")
-                for row in table[:6]:
-                    print("   " + " | ".join(str(c or "").replace("\n", " ") for c in row))
+def cells(row):
+    return [strip(c) for c in re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", row, flags=S)]
 
 
 def main():
     for name, url in PAGES.items():
         print(f"=== {name} ===")
-        print(url)
-        data, how = fetch(url)
-        if data is None:
-            print(f"✗ 頁面讀取失敗（{how}）")
-            print()
+        r = requests.get(url, headers=UA, timeout=60)
+        if r.status_code != 200:
+            print(f"✗ 讀取失敗：{r.status_code}")
             continue
-        html = data.decode("utf-8", errors="replace")
-        print(f"✓ 頁面 {len(html) // 1024} KB（{how}）")
-        show_tables(html)
-        show_hints(html, url)
-        show_text(html)
-        found = links(html, url)
-        print(f"相關連結 {len(found)} 條：")
-        for u, t in found[:60]:
-            print(f" - {t[:50]} → {u}")
+        html = r.content.decode("utf-8", errors="replace")
+        html = re.sub(r"<(script|style)\b.*?</\1>", " ", html, flags=S)
+        html = re.sub(r"<!--.*?-->", " ", html, flags=S)
+
+        labels = {}
+        for pid, inner in re.findall(r'<a\b[^>]*href=["\'][^"\']*#(rwd-tabs[^"\']+)["\'][^>]*>(.*?)</a>',
+                                     html, flags=S):
+            labels[pid] = strip(inner)
+        panels = [(m.start(), m.group(1))
+                  for m in re.finditer(r'id=["\'](rwd-tabs[^"\']*-content)["\']', html)]
+        print("分頁：", labels)
+        print("分頁位置：", [(pos, labels.get(pid, pid[-12:])) for pos, pid in panels])
+
+        others = collections.Counter()
+        shown = 0
+        idx = 0
+        for n, m in enumerate(re.finditer(r"<table\b.*?</table>", html, flags=S), 1):
+            rows = [cells(x) for x in re.findall(r"<tr\b.*?</tr>", m.group(0), flags=S)]
+            rows = [x for x in rows if x]
+            head = rows[0] if rows else []
+            first_year = next((i for i, c in enumerate(head) if "保單年度" in c), None)
+            if first_year is None or len(rows) < 2:
+                others[(head[0][:30] if head else "（空）", len(rows))] += 1
+                continue
+            idx += 1
+            panel = ""
+            for pos, pid in panels:
+                if pos < m.start():
+                    panel = labels.get(pid, pid[-12:])
+            before = nodes(html[max(0, m.start() - 5000):m.start()])
+            widths = sorted({len(x) for x in rows})
+            spans = len(re.findall(r"(?:row|col)span", m.group(0), flags=re.I))
+            print(f"#{idx}（表格 {n}，位置 {m.start()}）｜分頁 {panel}｜{len(rows) - 1} 行"
+                  f"｜每行格數 {widths}｜年度前的欄 {head[:first_year]}｜合併格 {spans}"
+                  f"｜首欄 {[x[0] for x in rows[1:]]}")
+            print("   前文：" + " ‖ ".join(t[2][:40] for t in before[-8:]))
+            if shown < 3:
+                shown += 1
+                print("   --- 前 15 段文字的標籤 ---")
+                for tag, cls, text in before[-15:]:
+                    print(f"      <{tag} class='{cls}'> {text}")
+                if shown == 1:
+                    raw = re.sub(r"\s+", " ", html[max(0, m.start() - 2500):m.start()])
+                    print("   --- 表格前的原始 HTML ---")
+                    for i in range(0, len(raw), 300):
+                        print("      " + raw[i:i + 300])
+                    after = nodes(html[m.end():m.end() + 2000])
+                    print("   --- 表格後 6 段文字 ---")
+                    for tag, cls, text in after[:6]:
+                        print(f"      <{tag} class='{cls}'> {text}")
+        print(f"資料表格 {idx} 個｜其他表格（首格文字, 行數）：", dict(others))
         print()
-        pdfs = [(u, t) for u, t in found if ".pdf" in u.lower()]
-        for u, t in pdfs[:MAX_PDF]:
-            print(f">> {t[:50]}")
-            print(f"   {u}")
-            try:
-                show_pdf(u)
-            except Exception as e:
-                print(f"   ✗ 讀取出錯：{type(e).__name__} {e}")
-            print()
-        if len(pdfs) > MAX_PDF:
-            print(f"（PDF 共 {len(pdfs)} 份，只試前 {MAX_PDF} 份）")
-            print()
     print("探查完成（只讀，沒有上傳）")
 
 
