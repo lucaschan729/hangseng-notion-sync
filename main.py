@@ -28,6 +28,10 @@ S = re.S | re.I
 PCT = re.compile(r"^(\d+(?:\.\d+)?)\s*%$")
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 NOTION = "https://api.notion.com/v1"
+HINTS = {
+    401: "NOTION_TOKEN 無效：請到 repo 的 Settings → Secrets 重新貼上「AIA 自動更新」的 Internal Integration Secret",
+    404: "找不到資料庫：請確認資料庫已連接「AIA 自動更新」，以及 NOTION_DATABASE_ID 指向原始資料庫",
+}
 
 
 class Stop(Exception):
@@ -248,12 +252,15 @@ def notion(method, path, token, **kw):
     headers = {"Authorization": f"Bearer {token}", "Notion-Version": "2025-09-03"}
     r = requests.request(method, NOTION + path, headers=headers, timeout=120, **kw)
     if r.status_code >= 300:
-        raise Stop(f"Notion {method} {path.split('?')[0]} 失敗：{r.status_code} {r.text[:300]}")
+        hint = HINTS.get(r.status_code, "")
+        raise Stop(f"Notion {method} {path.split('?')[0]} 失敗：{r.status_code} {r.text[:300]}"
+                   + (f"\n→ {hint}" if hint else ""))
     return r.json()
 
 
 def upload(path, year, digest, now):
-    token, dbid = os.environ.get("NOTION_TOKEN", ""), os.environ.get("NOTION_DATABASE_ID", "")
+    token = os.environ.get("NOTION_TOKEN", "").strip()
+    dbid = os.environ.get("NOTION_DATABASE_ID", "").strip()
     if not token or not dbid:
         raise Stop("缺少 NOTION_TOKEN 或 NOTION_DATABASE_ID")
     db = notion("GET", f"/databases/{dbid}", token)
